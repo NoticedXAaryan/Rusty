@@ -51,6 +51,7 @@ Create a project with `cargo run -- new hello`. A project contains `Rusty.toml`,
 - [Grammar](docs/grammar-v0.md)
 - [Canonical RIR](docs/rir-v0.md)
 - [ABI and reference backend](docs/abi-v0.md)
+- [Conformance policy](docs/conformance-v0.md)
 
 ## Development
 
