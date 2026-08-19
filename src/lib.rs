@@ -8,7 +8,9 @@ pub mod lexer;
 pub mod llvm;
 pub mod parser;
 pub mod project;
+pub mod research;
 pub mod rir;
+pub mod rustybench;
 pub mod sema;
 pub mod token;
 

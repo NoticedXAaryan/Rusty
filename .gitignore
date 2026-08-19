@@ -8,14 +8,33 @@
 /benchmarks/
 /datasets/
 /models/
-/ml/checkpoints/
+/ml/
 /paper/
+
+# Model, dataset, notebook, and Python artifacts must never leak from other paths
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.parquet
+*.arrow
+*.ipynb
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
 
 # Local experiment and profiling output
 *.profraw
 *.profdata
 *.bench.json
+*.bench.tsv
+*.trace.json
 *.log
+/coverage/
 
 # Local environment and editor state
 .env

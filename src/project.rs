@@ -155,17 +155,23 @@ impl Project {
         Ok(passed)
     }
 
-    pub fn bench(&self, repeat: usize, warmup: usize) -> Result<benchmark::Report> {
+    pub fn bench(
+        &self,
+        repeat: usize,
+        warmup: usize,
+        args: &[String],
+    ) -> Result<benchmark::Report> {
         if repeat == 0 {
             return Err("benchmark repeat count must be greater than zero".to_owned());
         }
         let artifacts = self.build(Optimization::O3)?;
         let execute = || {
             let output = Command::new(&artifacts.executable)
+                .args(args)
                 .output()
                 .map_err(|error| format!("benchmark failed: {error}"))?;
             if output.status.success() {
-                Ok(())
+                Ok(output)
             } else {
                 Err(format!("benchmark program failed with {}", output.status))
             }

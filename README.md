@@ -29,7 +29,7 @@ source → lexer → parser → name resolution → type checker
        → typed HIR → canonical RIR → LLVM IR → native executable
 ```
 
-The current compiler includes source-located diagnostics, deterministic name and type resolution, byte-stable RIR serialization, guarded integer division, short-circuit logic, project discovery, native linking, and an explicit reference fallback when an unavailable optimization backend is requested.
+The current compiler includes source-located diagnostics, deterministic name and type resolution, byte-stable RIR serialization, guarded integer division, short-circuit logic, project discovery, native linking, an explicit reference fallback when an unavailable optimization backend is requested, and a data-agnostic RustyBench harness with frozen split/checksum enforcement. Private research definitions, workloads, models, and results are excluded from version control.
 
 ## Build and run
 
@@ -41,6 +41,9 @@ cargo run -- check examples/hello
 cargo run -- run examples/hello -O2
 cargo run -- run examples/control -O3
 cargo run -- test examples/control
+cargo run --release -- bench examples/control --warmup 5 --repeat 50
+cargo run --release -- bench --suite benchmarks/suite.tsv --output results/raw/run.bench.json
+cargo run -- research list
 ```
 
 Create a project with `cargo run -- new hello`. A project contains `Rusty.toml`, `src/main.ry`, and optional standalone `tests/*.ry` programs. Builds place canonical `.rir`, generated `.ll`, and the native executable in the project's ignored `build/` directory.
@@ -64,4 +67,4 @@ cargo test --workspace --all-targets
 cargo build --workspace --all-targets --release
 ```
 
-Rusty does not currently make a neural-performance claim. The `bench` command is a local reference-backend timing aid, not a substitute for a controlled benchmark study.
+Rusty does not currently make a neural-performance claim. The single-project `bench` command is a local reference-backend timing aid. The RustyBench suite mode enforces frozen private inputs, output oracles, leakage-resistant splits, retained samples, and machine-readable records, but comparative claims still require strong frozen baselines and independent reproduction. Neural experiments remain explicitly blocked until a local model, licensed frozen data, and an adequate sandbox/verifier are available.

@@ -1,4 +1,7 @@
 use rusty_lang::project::{self, Optimization, Project};
+use rusty_lang::research::{self, Registry};
+use rusty_lang::rustybench::{self, Split, Suite};
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -27,6 +30,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
     }
     match command {
         "new" => command_new(&args[1..]),
+        "research" => command_research(&args[1..]),
         "build" | "run" | "check" | "test" | "bench" | "optimize" | "clean" => {
             command_project(command, &args[1..])
         }
@@ -43,12 +47,83 @@ fn command_new(args: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
+fn command_research(args: &[String]) -> Result<u8, String> {
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err("usage: rusty research <list|run|compare|report> [experiment]".to_owned());
+    };
+    let workspace = std::env::current_dir()
+        .map_err(|error| format!("cannot determine workspace directory: {error}"))?;
+    let registry_path = std::env::var_os("RUSTY_RESEARCH_REGISTRY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("research").join("registry"));
+    let registry = Registry::load(&registry_path)?;
+    match action {
+        "list" => {
+            if args.len() != 1 {
+                return Err("usage: rusty research list".to_owned());
+            }
+            for experiment in &registry.experiments {
+                println!(
+                    "{} status={} runner={} title={}",
+                    experiment.id,
+                    experiment.status,
+                    experiment.runner.as_deref().unwrap_or("unassigned"),
+                    experiment.title
+                );
+            }
+        }
+        "run" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| "usage: rusty research run <experiment> [--repeat N]".to_owned())?;
+            let mut repeat = 1;
+            if args.len() > 2 {
+                if args.get(2).map(String::as_str) != Some("--repeat") || args.len() != 4 {
+                    return Err("usage: rusty research run <experiment> [--repeat N]".to_owned());
+                }
+                repeat = args[3]
+                    .parse()
+                    .map_err(|_| "--repeat requires a positive integer")?;
+            }
+            let output = research::run_experiment(&workspace, registry.find(id)?, repeat)?;
+            println!("record={}", output.display());
+        }
+        "compare" => {
+            if args.len() != 2 {
+                return Err("usage: rusty research compare <experiment>".to_owned());
+            }
+            registry.find(&args[1])?;
+            let summary = research::compare(&workspace, &args[1])?;
+            println!(
+                "experiment={} records={} successful_trials={} failed_trials={}",
+                args[1], summary.records, summary.successful_trials, summary.failed_trials
+            );
+        }
+        "report" => {
+            if args.len() != 2 {
+                return Err("usage: rusty research report <experiment>".to_owned());
+            }
+            let output = research::write_report(&workspace, registry.find(&args[1])?)?;
+            println!("report={}", output.display());
+        }
+        _ => return Err(format!("unknown research command `{action}`")),
+    }
+    Ok(0)
+}
+
 struct ProjectArgs {
     path: Option<PathBuf>,
     optimization: Optimization,
     neural_requested: bool,
+    performance_gate: bool,
+    budget: usize,
+    target_cpu: String,
+    minimum_speedup: f64,
     repeat: usize,
     warmup: usize,
+    suite: Option<PathBuf>,
+    output: Option<PathBuf>,
+    split: Option<Split>,
     program_args: Vec<String>,
 }
 
@@ -57,8 +132,15 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
         path: None,
         optimization: Optimization::O0,
         neural_requested: false,
+        performance_gate: false,
+        budget: 8,
+        target_cpu: "native".to_owned(),
+        minimum_speedup: 0.02,
         repeat: 30,
         warmup: 3,
+        suite: None,
+        output: None,
+        split: None,
         program_args: Vec::new(),
     };
     let mut index = 0;
@@ -75,8 +157,12 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                 parsed.optimization = Optimization::O3;
                 parsed.neural_requested = true;
             }
-            "--performance-gate" => parsed.neural_requested = true,
-            "--target-cpu" | "--minimum-speedup" | "--budget" | "--repeat" | "--warmup" => {
+            "--performance-gate" => {
+                parsed.neural_requested = true;
+                parsed.performance_gate = true;
+            }
+            "--target-cpu" | "--minimum-speedup" | "--budget" | "--repeat" | "--warmup"
+            | "--suite" | "--output" | "--split" => {
                 let flag = args[index].clone();
                 index += 1;
                 let value = args
@@ -86,7 +172,10 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                     "--repeat" => {
                         parsed.repeat = value
                             .parse()
-                            .map_err(|_| "--repeat requires a positive integer")?
+                            .map_err(|_| "--repeat requires a positive integer")?;
+                        if parsed.repeat == 0 {
+                            return Err("--repeat requires a positive integer".to_owned());
+                        }
                     }
                     "--warmup" => {
                         parsed.warmup = value
@@ -94,10 +183,32 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                             .map_err(|_| "--warmup requires a non-negative integer")?
                     }
                     "--budget" => {
-                        let _: usize = value.parse().map_err(|_| "--budget requires an integer")?;
+                        parsed.budget = value
+                            .parse()
+                            .map_err(|_| "--budget requires a positive integer")?;
+                        if parsed.budget == 0 {
+                            return Err("--budget requires a positive integer".to_owned());
+                        }
                         parsed.neural_requested = true;
                     }
-                    "--target-cpu" | "--minimum-speedup" => parsed.neural_requested = true,
+                    "--target-cpu" => {
+                        if value.is_empty()
+                            || !value.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                            })
+                        {
+                            return Err("--target-cpu contains invalid characters".to_owned());
+                        }
+                        parsed.target_cpu.clone_from(value);
+                        parsed.neural_requested = true;
+                    }
+                    "--minimum-speedup" => {
+                        parsed.minimum_speedup = parse_speedup(value)?;
+                        parsed.neural_requested = true;
+                    }
+                    "--suite" => parsed.suite = Some(PathBuf::from(value)),
+                    "--output" => parsed.output = Some(PathBuf::from(value)),
+                    "--split" => parsed.split = Some(Split::parse(value)?),
                     _ => unreachable!(),
                 }
             }
@@ -116,8 +227,27 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
     Ok(parsed)
 }
 
+fn parse_speedup(value: &str) -> Result<f64, String> {
+    let (number, divisor) = value
+        .strip_suffix('%')
+        .map_or((value, 1.0), |number| (number, 100.0));
+    let parsed = number
+        .parse::<f64>()
+        .map_err(|_| "--minimum-speedup requires a non-negative number or percentage")?
+        / divisor;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("--minimum-speedup requires a non-negative finite value".to_owned());
+    }
+    Ok(parsed)
+}
+
 fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
     let args = parse_project_args(args)?;
+    if command == "bench"
+        && let Some(manifest) = args.suite.as_deref()
+    {
+        return command_benchmark_suite(manifest, &args);
+    }
     let project = Project::discover(args.path.as_deref())?;
     match command {
         "check" => {
@@ -143,10 +273,10 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
         }
         "bench" => {
             eprintln!(
-                "note: reference-only whole-process timing; private workloads and results are not recorded"
+                "note: reference-only whole-process timing; use --suite for frozen private RustyBench inputs"
             );
             fallback_notice(args.neural_requested);
-            let report = project.bench(args.repeat, args.warmup)?;
+            let report = project.bench(args.repeat, args.warmup, &args.program_args)?;
             let statistics = report.statistics;
             println!(
                 "reference warmup={} samples={} min_ns={} max_ns={}",
@@ -156,8 +286,10 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
                 statistics.maximum_ns
             );
             println!(
-                "median_ns={:.0} mean_ns={:.0} variance_ns2={:.0} stddev_ns={:.0}",
+                "median_ns={:.0} median_ci95_ns=[{:.0},{:.0}] mean_ns={:.0} variance_ns2={:.0} stddev_ns={:.0}",
                 statistics.median_ns,
+                statistics.median_ci95_low_ns,
+                statistics.median_ci95_high_ns,
                 statistics.mean_ns,
                 statistics.variance_ns2,
                 statistics.standard_deviation_ns
@@ -174,7 +306,10 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
             eprintln!("fallback: building the trusted reference backend with clang -O3");
             let artifacts = project.build(Optimization::O3)?;
             print_artifacts(&project, &artifacts);
-            println!("selection=REFERENCE_FALLBACK reason=NEURAL_UNAVAILABLE");
+            println!(
+                "selection=REFERENCE_FALLBACK reason=NEURAL_UNAVAILABLE budget={} target_cpu={} performance_gate={} minimum_speedup={:.6}",
+                args.budget, args.target_cpu, args.performance_gate, args.minimum_speedup
+            );
         }
         "clean" => {
             if project.clean()? {
@@ -184,6 +319,48 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
             }
         }
         _ => unreachable!(),
+    }
+    Ok(0)
+}
+
+fn command_benchmark_suite(manifest: &std::path::Path, args: &ProjectArgs) -> Result<u8, String> {
+    if args.path.is_some() {
+        return Err("a project path cannot be combined with --suite".to_owned());
+    }
+    let suite = Suite::load(manifest)?;
+    let report = rustybench::run_suite(&suite, args.warmup, args.repeat, args.split)?;
+    println!(
+        "RustyBench cases={} warmup={} repeat={} backend=reference-clang-o3",
+        report.results.len(),
+        report.warmup,
+        report.repeat
+    );
+    for result in &report.results {
+        println!(
+            "{} category={} split={} median_ns={:.0} outliers={}",
+            result.id,
+            result.category.as_str(),
+            result.split.as_str(),
+            result.statistics.median_ns,
+            result.statistics.tukey_outliers
+        );
+    }
+    println!(
+        "geometric_mean_median_ns={:.0} outlier_policy=retain-all",
+        report.geometric_mean_median_ns().unwrap_or_default()
+    );
+    if let Some(path) = &args.output {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        fs::write(path, report.to_json())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        println!("record={}", path.display());
+    } else {
+        eprintln!("note: no result record written; pass --output <private-path>.bench.json");
     }
     Ok(0)
 }
@@ -214,7 +391,10 @@ fn print_usage() {
     println!("  build [project] [-O0|-O2|-O3|-Oai]");
     println!("  run [project] [-- args...] Build and execute");
     println!("  test [project]             Check and run tests/*.ry");
-    println!("  bench [project] [--warmup N] [--repeat N]");
-    println!("  optimize [project]         Honest reference fallback");
+    println!("  bench [project] [--warmup N] [--repeat N] [-- args...]");
+    println!("  bench --suite FILE [--split NAME] [--output FILE]");
+    println!("  optimize [project] [--budget N] [--target-cpu CPU]");
+    println!("                     [--performance-gate] [--minimum-speedup 2%]");
+    println!("  research list|run|compare|report");
     println!("  clean [project]            Remove project build artifacts");
 }
