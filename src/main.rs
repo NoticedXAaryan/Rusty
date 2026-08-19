@@ -1,9 +1,11 @@
+use rusty_lang::neural::Options as NeuralOptions;
+use rusty_lang::optimization;
 use rusty_lang::project::{self, Optimization, Project};
 use rusty_lang::research::{self, Registry};
 use rusty_lang::rustybench::{self, Split, Suite};
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -115,7 +117,6 @@ struct ProjectArgs {
     path: Option<PathBuf>,
     optimization: Optimization,
     neural_requested: bool,
-    performance_gate: bool,
     budget: usize,
     target_cpu: String,
     minimum_speedup: f64,
@@ -132,7 +133,6 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
         path: None,
         optimization: Optimization::O0,
         neural_requested: false,
-        performance_gate: false,
         budget: 8,
         target_cpu: "native".to_owned(),
         minimum_speedup: 0.02,
@@ -159,7 +159,6 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
             }
             "--performance-gate" => {
                 parsed.neural_requested = true;
-                parsed.performance_gate = true;
             }
             "--target-cpu" | "--minimum-speedup" | "--budget" | "--repeat" | "--warmup"
             | "--suite" | "--output" | "--split" => {
@@ -255,13 +254,28 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
             println!("Checked {}", project.name);
         }
         "build" => {
-            fallback_notice(args.neural_requested);
-            let artifacts = project.build(args.optimization)?;
-            print_artifacts(&project, &artifacts);
+            if should_attempt_neural(args.neural_requested) {
+                let outcome = run_optimization(&project, &args)?;
+                print_artifacts(&project, &outcome.artifacts);
+                print_optimization_outcome(&outcome, &args);
+            } else {
+                fallback_notice(false);
+                let artifacts = project.build(args.optimization)?;
+                print_artifacts(&project, &artifacts);
+            }
         }
         "run" => {
-            fallback_notice(args.neural_requested);
-            let status = project.run(args.optimization, &args.program_args)?;
+            let status = if should_attempt_neural(args.neural_requested) {
+                let outcome = run_optimization(&project, &args)?;
+                print_optimization_outcome(&outcome, &args);
+                Command::new(&outcome.artifacts.executable)
+                    .args(&args.program_args)
+                    .status()
+                    .map_err(|error| format!("cannot run optimized program: {error}"))?
+            } else {
+                fallback_notice(false);
+                project.run(args.optimization, &args.program_args)?
+            };
             if !status.success() {
                 return Ok(status.code().unwrap_or(1).clamp(1, 255) as u8);
             }
@@ -302,14 +316,9 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
             );
         }
         "optimize" => {
-            eprintln!("neural backend unavailable: no candidates were generated or measured");
-            eprintln!("fallback: building the trusted reference backend with clang -O3");
-            let artifacts = project.build(Optimization::O3)?;
-            print_artifacts(&project, &artifacts);
-            println!(
-                "selection=REFERENCE_FALLBACK reason=NEURAL_UNAVAILABLE budget={} target_cpu={} performance_gate={} minimum_speedup={:.6}",
-                args.budget, args.target_cpu, args.performance_gate, args.minimum_speedup
-            );
+            let outcome = run_optimization(&project, &args)?;
+            print_artifacts(&project, &outcome.artifacts);
+            print_optimization_outcome(&outcome, &args);
         }
         "clean" => {
             if project.clean()? {
@@ -321,6 +330,67 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
         _ => unreachable!(),
     }
     Ok(0)
+}
+
+fn should_attempt_neural(requested: bool) -> bool {
+    requested || std::env::var_os("RUSTY_NEURAL_GENERATOR").is_some()
+}
+
+fn run_optimization(
+    project: &Project,
+    args: &ProjectArgs,
+) -> Result<optimization::Outcome, String> {
+    let options = NeuralOptions::new(
+        args.budget,
+        args.target_cpu.clone(),
+        args.minimum_speedup,
+        args.warmup,
+        args.repeat,
+    )?;
+    optimization::optimize(project, &options, &args.program_args)
+}
+
+fn print_optimization_outcome(outcome: &optimization::Outcome, args: &ProjectArgs) {
+    for candidate in &outcome.candidates {
+        if let Some(comparison) = &candidate.comparison {
+            println!(
+                "candidate={} classification={} generation_ms={} speedup={:.6} ci95=[{:.6},{:.6}] accepted={} reason={}",
+                candidate.candidate,
+                candidate.classification.as_str(),
+                candidate.generation_ms,
+                comparison.speedup,
+                comparison.speedup_ci95_low,
+                comparison.speedup_ci95_high,
+                comparison.accepted,
+                candidate.reason
+            );
+        } else {
+            println!(
+                "candidate={} classification={} generation_ms={} reason={}",
+                candidate.candidate,
+                candidate.classification.as_str(),
+                candidate.generation_ms,
+                candidate.reason
+            );
+        }
+    }
+    if let Some(candidate) = outcome.selected_candidate {
+        println!(
+            "selection=NEURAL candidate={} budget={} target_cpu={} minimum_speedup={:.6}",
+            candidate, args.budget, args.target_cpu, args.minimum_speedup
+        );
+    } else {
+        println!(
+            "selection=REFERENCE_FALLBACK reason={} budget={} target_cpu={} minimum_speedup={:.6}",
+            outcome
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("NO_ACCEPTED_CANDIDATE"),
+            args.budget,
+            args.target_cpu,
+            args.minimum_speedup
+        );
+    }
 }
 
 fn command_benchmark_suite(manifest: &std::path::Path, args: &ProjectArgs) -> Result<u8, String> {
@@ -368,10 +438,10 @@ fn command_benchmark_suite(manifest: &std::path::Path, args: &ProjectArgs) -> Re
 fn fallback_notice(neural_requested: bool) {
     if neural_requested {
         eprintln!(
-            "neural backend unavailable: using trusted reference fallback (no neural performance claim)"
+            "neural optimization is not applied to this command; using trusted reference output"
         );
     } else {
-        eprintln!("backend: trusted reference (neural backend unavailable in this milestone)");
+        eprintln!("backend: trusted reference");
     }
 }
 

@@ -100,7 +100,7 @@ impl Project {
         let executable = directory.join(executable_name(name));
         write_if_changed(&rir_path, &rir_text)?;
         write_if_changed(&llvm_path, &llvm_text)?;
-        invoke_clang(&llvm_path, &executable, optimization)?;
+        invoke_clang(&llvm_path, &executable, optimization, None)?;
         Ok(Artifacts {
             rir: rir_path,
             llvm: llvm_path,
@@ -251,10 +251,28 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
-fn invoke_clang(llvm: &Path, executable: &Path, optimization: Optimization) -> Result<()> {
+pub fn compile_llvm(
+    llvm: &Path,
+    executable: &Path,
+    optimization: Optimization,
+    target_cpu: Option<&str>,
+) -> Result<()> {
+    invoke_clang(llvm, executable, optimization, target_cpu)
+}
+
+fn invoke_clang(
+    llvm: &Path,
+    executable: &Path,
+    optimization: Optimization,
+    target_cpu: Option<&str>,
+) -> Result<()> {
     let clang = std::env::var_os("CLANG").unwrap_or_else(|| "clang".into());
-    let output = Command::new(&clang)
-        .arg(optimization.clang_flag())
+    let mut command = Command::new(&clang);
+    command.arg(optimization.clang_flag());
+    if let Some(cpu) = target_cpu {
+        command.arg(format!("-march={cpu}"));
+    }
+    let output = command
         .arg(llvm)
         .arg("-o")
         .arg(executable)

@@ -55,7 +55,8 @@ Create a project with `cargo run -- new hello`. A project contains `Rusty.toml`,
 - [Canonical RIR](docs/rir-v0.md)
 - [ABI and reference backend](docs/abi-v0.md)
 - [Conformance policy](docs/conformance-v0.md)
-- [Benchmark command](docs/benchmarking.md)
+- [Benchmarking and RustyBench](docs/benchmarking.md)
+- [Neural optimization protocol](docs/optimization.md)
 
 ## Development
 
@@ -67,4 +68,4 @@ cargo test --workspace --all-targets
 cargo build --workspace --all-targets --release
 ```
 
-Rusty does not currently make a neural-performance claim. The single-project `bench` command is a local reference-backend timing aid. The RustyBench suite mode enforces frozen private inputs, output oracles, leakage-resistant splits, retained samples, and machine-readable records, but comparative claims still require strong frozen baselines and independent reproduction. Neural experiments remain explicitly blocked until a local model, licensed frozen data, and an adequate sandbox/verifier are available.
+Rusty does not currently make a neural-performance claim. The single-project `bench` command is a local reference-backend timing aid. The RustyBench suite mode enforces frozen private inputs, output oracles, leakage-resistant splits, retained samples, and machine-readable records, but comparative claims still require strong frozen baselines and independent reproduction. `rusty optimize` supports a local external generator, mandatory sandboxed differential execution, repeated whole-program timing, statistical selection, and unconditional trusted fallback; no neural model result is claimed until measured.

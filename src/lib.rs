@@ -6,6 +6,8 @@ pub mod diagnostic;
 pub mod hir;
 pub mod lexer;
 pub mod llvm;
+pub mod neural;
+pub mod optimization;
 pub mod parser;
 pub mod project;
 pub mod research;
@@ -13,6 +15,7 @@ pub mod rir;
 pub mod rustybench;
 pub mod sema;
 pub mod token;
+pub mod verifier;
 
 use diagnostic::Diagnostic;
 use hir::Program as HirProgram;
