@@ -1,0 +1,28 @@
+/target/
+**/build/
+
+# Private product and research material
+/PRD.md
+/research/
+/results/
+/datasets/
+/models/
+/ml/checkpoints/
+/paper/
+
+# Local experiment and profiling output
+*.profraw
+*.profdata
+*.bench.json
+*.log
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.kiro/
+.DS_Store
+Thumbs.db
+*.pdb

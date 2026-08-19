@@ -1,0 +1,12 @@
+fn main() -> int {
+    var sum = 0
+    for i in 0..4 {
+        sum += i
+    }
+    if sum == 6 {
+        print("smoke ok")
+        return 0
+    } else {
+        return 1
+    }
+}
