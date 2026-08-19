@@ -1,4 +1,4 @@
-use crate::{analyze, llvm, rir};
+use crate::{analyze, benchmark, llvm, rir};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,24 +155,37 @@ impl Project {
         Ok(passed)
     }
 
-    pub fn bench(&self, repeat: usize) -> Result<(u128, u128, usize)> {
+    pub fn bench(&self, repeat: usize, warmup: usize) -> Result<benchmark::Report> {
         if repeat == 0 {
             return Err("benchmark repeat count must be greater than zero".to_owned());
         }
         let artifacts = self.build(Optimization::O3)?;
-        let mut samples = Vec::with_capacity(repeat);
-        for _ in 0..repeat {
-            let start = Instant::now();
+        let execute = || {
             let output = Command::new(&artifacts.executable)
                 .output()
                 .map_err(|error| format!("benchmark failed: {error}"))?;
-            if !output.status.success() {
-                return Err(format!("benchmark program failed with {}", output.status));
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!("benchmark program failed with {}", output.status))
             }
-            samples.push(start.elapsed().as_nanos());
+        };
+        for _ in 0..warmup {
+            execute()?;
         }
-        samples.sort_unstable();
-        Ok((samples[samples.len() / 2], samples[0], repeat))
+        let mut samples_ns = Vec::with_capacity(repeat);
+        for _ in 0..repeat {
+            let start = Instant::now();
+            execute()?;
+            samples_ns.push(start.elapsed().as_nanos());
+        }
+        let statistics = benchmark::Statistics::from_samples(&samples_ns)
+            .expect("a positive repeat count produces samples");
+        Ok(benchmark::Report {
+            warmup_runs: warmup,
+            samples_ns,
+            statistics,
+        })
     }
 
     pub fn clean(&self) -> Result<bool> {

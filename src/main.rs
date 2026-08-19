@@ -48,6 +48,7 @@ struct ProjectArgs {
     optimization: Optimization,
     neural_requested: bool,
     repeat: usize,
+    warmup: usize,
     program_args: Vec<String>,
 }
 
@@ -56,7 +57,8 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
         path: None,
         optimization: Optimization::O0,
         neural_requested: false,
-        repeat: 10,
+        repeat: 30,
+        warmup: 3,
         program_args: Vec::new(),
     };
     let mut index = 0;
@@ -74,7 +76,7 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                 parsed.neural_requested = true;
             }
             "--performance-gate" => parsed.neural_requested = true,
-            "--target-cpu" | "--minimum-speedup" | "--budget" | "--repeat" => {
+            "--target-cpu" | "--minimum-speedup" | "--budget" | "--repeat" | "--warmup" => {
                 let flag = args[index].clone();
                 index += 1;
                 let value = args
@@ -85,6 +87,11 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                         parsed.repeat = value
                             .parse()
                             .map_err(|_| "--repeat requires a positive integer")?
+                    }
+                    "--warmup" => {
+                        parsed.warmup = value
+                            .parse()
+                            .map_err(|_| "--warmup requires a non-negative integer")?
                     }
                     "--budget" => {
                         let _: usize = value.parse().map_err(|_| "--budget requires an integer")?;
@@ -136,11 +143,31 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
         }
         "bench" => {
             eprintln!(
-                "note: reference-only wall-clock sample; this is not a publishable statistical comparison"
+                "note: reference-only whole-process timing; private workloads and results are not recorded"
             );
             fallback_notice(args.neural_requested);
-            let (median, minimum, repeat) = project.bench(args.repeat)?;
-            println!("reference samples={repeat} median_ns={median} min_ns={minimum}");
+            let report = project.bench(args.repeat, args.warmup)?;
+            let statistics = report.statistics;
+            println!(
+                "reference warmup={} samples={} min_ns={} max_ns={}",
+                report.warmup_runs,
+                report.samples_ns.len(),
+                statistics.minimum_ns,
+                statistics.maximum_ns
+            );
+            println!(
+                "median_ns={:.0} mean_ns={:.0} variance_ns2={:.0} stddev_ns={:.0}",
+                statistics.median_ns,
+                statistics.mean_ns,
+                statistics.variance_ns2,
+                statistics.standard_deviation_ns
+            );
+            println!(
+                "mean_ci95_ns=[{:.0},{:.0}] tukey_outliers={} outlier_policy=retain-all",
+                statistics.mean_ci95_low_ns,
+                statistics.mean_ci95_high_ns,
+                statistics.tukey_outliers
+            );
         }
         "optimize" => {
             eprintln!("neural backend unavailable: no candidates were generated or measured");
@@ -187,7 +214,7 @@ fn print_usage() {
     println!("  build [project] [-O0|-O2|-O3|-Oai]");
     println!("  run [project] [-- args...] Build and execute");
     println!("  test [project]             Check and run tests/*.ry");
-    println!("  bench [project] [--repeat N]");
+    println!("  bench [project] [--warmup N] [--repeat N]");
     println!("  optimize [project]         Honest reference fallback");
     println!("  clean [project]            Remove project build artifacts");
 }

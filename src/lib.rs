@@ -1,6 +1,7 @@
 //! Deterministic frontend and trusted reference backend for Rusty v0.
 
 pub mod ast;
+pub mod benchmark;
 pub mod diagnostic;
 pub mod hir;
 pub mod lexer;
