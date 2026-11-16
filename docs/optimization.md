@@ -1,5 +1,9 @@
 # Neural optimization protocol
 
+Two untrusted paths sit beside the reference backend.
+
+`rusty build --backend search` (and `rusty bench --suite FILE --compare`) searches a small coreset of RIR rewrites: constant folding, inlining of pure functions, closed forms for affine and periodic loops, and bounded partial evaluation of closed programs. A fixed linear cost model ranks pipelines. It is not a trained model. The interpreter checks candidates that finish inside the step budget, and a native `-O0` differential check (stdout, stderr, exit status) runs before a rewrite may replace the reference binary. LLVM for this path is emitted only by the trusted backend, so the external sandbox is not required. A mismatch restores the reference. The research rationale is in [the RIR optimization note](research/rir-optimization.md). Public development measurements are in [measurements](research/measurements.md).
+
 `rusty optimize <project>` and `rusty build <project> -Oai` always build the trusted `-O3` reference executable first. When a generator is configured, ordinary `build` and `run` also use the same safe neural-first path; without local configuration they remain reference-only. Neural optimization is attempted only when both local integration points are configured:
 
 ```text

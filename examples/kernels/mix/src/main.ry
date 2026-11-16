@@ -1,0 +1,15 @@
+fn mix(x: int) -> int {
+    var y = x % 97
+    if y < 0 {
+        y = 0 - y
+    }
+    return y * 3 + 1
+}
+
+fn main() {
+    var acc = 0
+    for i in 0..1500000 {
+        acc += mix(i)
+    }
+    print(acc)
+}

@@ -80,7 +80,7 @@ impl Project {
         let source = fs::read_to_string(&self.source)
             .map_err(|error| format!("cannot read {}: {error}", self.source.display()))?;
         let hir = analyze(&display_path(&self.source), &source).map_err(render_diagnostics)?;
-        self.build_hir(&hir, &self.root.join("build"), &self.name, optimization)
+        emit_executable(&hir, &self.root.join("build"), &self.name, optimization)
     }
 
     fn build_hir(
@@ -90,22 +90,7 @@ impl Project {
         name: &str,
         optimization: Optimization,
     ) -> Result<Artifacts> {
-        let rir_program = rir::Program::from_hir(hir);
-        let rir_text = rir_program.serialize();
-        let llvm_text = llvm::emit(&rir_program);
-        fs::create_dir_all(directory)
-            .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
-        let rir_path = directory.join(format!("{name}.rir"));
-        let llvm_path = directory.join(format!("{name}.ll"));
-        let executable = directory.join(executable_name(name));
-        write_if_changed(&rir_path, &rir_text)?;
-        write_if_changed(&llvm_path, &llvm_text)?;
-        invoke_clang(&llvm_path, &executable, optimization, None)?;
-        Ok(Artifacts {
-            rir: rir_path,
-            llvm: llvm_path,
-            executable,
-        })
+        emit_executable(hir, directory, name, optimization)
     }
 
     pub fn run(&self, optimization: Optimization, args: &[String]) -> Result<ExitStatus> {
@@ -157,6 +142,7 @@ impl Project {
 
     pub fn bench(
         &self,
+        optimization: Optimization,
         repeat: usize,
         warmup: usize,
         args: &[String],
@@ -164,7 +150,7 @@ impl Project {
         if repeat == 0 {
             return Err("benchmark repeat count must be greater than zero".to_owned());
         }
-        let artifacts = self.build(Optimization::O3)?;
+        let artifacts = self.build(optimization)?;
         let execute = || {
             let output = Command::new(&artifacts.executable)
                 .args(args)
@@ -249,6 +235,30 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
         return Ok(());
     }
     fs::write(path, content).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+pub fn emit_executable(
+    program: &crate::hir::Program,
+    directory: &Path,
+    name: &str,
+    optimization: Optimization,
+) -> Result<Artifacts> {
+    let rir_program = rir::Program::from_hir(program);
+    let rir_text = rir_program.serialize();
+    let llvm_text = llvm::emit(&rir_program);
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let rir_path = directory.join(format!("{name}.rir"));
+    let llvm_path = directory.join(format!("{name}.ll"));
+    let executable = directory.join(executable_name(name));
+    write_if_changed(&rir_path, &rir_text)?;
+    write_if_changed(&llvm_path, &llvm_text)?;
+    invoke_clang(&llvm_path, &executable, optimization, None)?;
+    Ok(Artifacts {
+        rir: rir_path,
+        llvm: llvm_path,
+        executable,
+    })
 }
 
 pub fn compile_llvm(

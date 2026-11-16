@@ -1,7 +1,9 @@
+use rusty_lang::analyze;
 use rusty_lang::neural::Options as NeuralOptions;
 use rusty_lang::optimization;
 use rusty_lang::project::{self, Optimization, Project};
 use rusty_lang::research::{self, Registry};
+use rusty_lang::rewrite::{self, SearchOutcome};
 use rusty_lang::rustybench::{self, Split, Suite};
 use std::fs;
 use std::path::PathBuf;
@@ -113,9 +115,18 @@ fn command_research(args: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Backend {
+    Reference,
+    Search,
+    External,
+}
+
 struct ProjectArgs {
     path: Option<PathBuf>,
-    optimization: Optimization,
+    optimization: Option<Optimization>,
+    backend: Option<Backend>,
+    compare: bool,
     neural_requested: bool,
     budget: usize,
     target_cpu: String,
@@ -131,7 +142,9 @@ struct ProjectArgs {
 fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
     let mut parsed = ProjectArgs {
         path: None,
-        optimization: Optimization::O0,
+        optimization: None,
+        backend: None,
+        compare: false,
         neural_requested: false,
         budget: 8,
         target_cpu: "native".to_owned(),
@@ -150,12 +163,28 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                 parsed.program_args.extend_from_slice(&args[index + 1..]);
                 break;
             }
-            "-O0" => parsed.optimization = Optimization::O0,
-            "-O2" => parsed.optimization = Optimization::O2,
-            "-O3" => parsed.optimization = Optimization::O3,
+            "-O0" => parsed.optimization = Some(Optimization::O0),
+            "-O2" => parsed.optimization = Some(Optimization::O2),
+            "-O3" => parsed.optimization = Some(Optimization::O3),
             "-Oai" => {
-                parsed.optimization = Optimization::O3;
+                parsed.optimization = Some(Optimization::O3);
                 parsed.neural_requested = true;
+                parsed.backend = Some(Backend::External);
+            }
+            "--compare" => parsed.compare = true,
+            "--backend" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    "--backend requires reference, search, or external".to_owned()
+                })?;
+                parsed.backend = Some(match value.as_str() {
+                    "reference" => Backend::Reference,
+                    "search" => Backend::Search,
+                    "external" => Backend::External,
+                    _ => {
+                        return Err("--backend requires reference, search, or external".to_owned());
+                    }
+                });
             }
             "--performance-gate" => {
                 parsed.neural_requested = true;
@@ -253,28 +282,47 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
             project.check()?;
             println!("Checked {}", project.name);
         }
-        "build" => {
-            if should_attempt_neural(args.neural_requested) {
+        "build" => match selected_backend(&args) {
+            Backend::Search => {
+                let (artifacts, outcome, fallback) =
+                    build_with_search(&project, clang_level(&args))?;
+                print_artifacts(&project, &artifacts);
+                print_search_outcome(&outcome, fallback.as_deref());
+            }
+            Backend::External => {
                 let outcome = run_optimization(&project, &args)?;
                 print_artifacts(&project, &outcome.artifacts);
                 print_optimization_outcome(&outcome, &args);
-            } else {
+            }
+            Backend::Reference => {
                 fallback_notice(false);
-                let artifacts = project.build(args.optimization)?;
+                let artifacts = project.build(clang_level(&args))?;
                 print_artifacts(&project, &artifacts);
             }
-        }
+        },
         "run" => {
-            let status = if should_attempt_neural(args.neural_requested) {
-                let outcome = run_optimization(&project, &args)?;
-                print_optimization_outcome(&outcome, &args);
-                Command::new(&outcome.artifacts.executable)
-                    .args(&args.program_args)
-                    .status()
-                    .map_err(|error| format!("cannot run optimized program: {error}"))?
-            } else {
-                fallback_notice(false);
-                project.run(args.optimization, &args.program_args)?
+            let status = match selected_backend(&args) {
+                Backend::Search => {
+                    let (artifacts, outcome, fallback) =
+                        build_with_search(&project, clang_level(&args))?;
+                    print_search_outcome(&outcome, fallback.as_deref());
+                    Command::new(&artifacts.executable)
+                        .args(&args.program_args)
+                        .status()
+                        .map_err(|error| format!("cannot run searched program: {error}"))?
+                }
+                Backend::External => {
+                    let outcome = run_optimization(&project, &args)?;
+                    print_optimization_outcome(&outcome, &args);
+                    Command::new(&outcome.artifacts.executable)
+                        .args(&args.program_args)
+                        .status()
+                        .map_err(|error| format!("cannot run optimized program: {error}"))?
+                }
+                Backend::Reference => {
+                    fallback_notice(false);
+                    project.run(clang_level(&args), &args.program_args)?
+                }
             };
             if !status.success() {
                 return Ok(status.code().unwrap_or(1).clamp(1, 255) as u8);
@@ -290,7 +338,12 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
                 "note: reference-only whole-process timing; use --suite for frozen private RustyBench inputs"
             );
             fallback_notice(args.neural_requested);
-            let report = project.bench(args.repeat, args.warmup, &args.program_args)?;
+            let report = project.bench(
+                args.optimization.unwrap_or(Optimization::O3),
+                args.repeat,
+                args.warmup,
+                &args.program_args,
+            )?;
             let statistics = report.statistics;
             println!(
                 "reference warmup={} samples={} min_ns={} max_ns={}",
@@ -330,10 +383,6 @@ fn command_project(command: &str, args: &[String]) -> Result<u8, String> {
         _ => unreachable!(),
     }
     Ok(0)
-}
-
-fn should_attempt_neural(requested: bool) -> bool {
-    requested || std::env::var_os("RUSTY_NEURAL_GENERATOR").is_some()
 }
 
 fn run_optimization(
@@ -397,6 +446,9 @@ fn command_benchmark_suite(manifest: &std::path::Path, args: &ProjectArgs) -> Re
     if args.path.is_some() {
         return Err("a project path cannot be combined with --suite".to_owned());
     }
+    if args.compare {
+        return command_compare(manifest, args);
+    }
     let suite = Suite::load(manifest)?;
     let report = rustybench::run_suite(&suite, args.warmup, args.repeat, args.split)?;
     println!(
@@ -435,6 +487,147 @@ fn command_benchmark_suite(manifest: &std::path::Path, args: &ProjectArgs) -> Re
     Ok(0)
 }
 
+fn selected_backend(args: &ProjectArgs) -> Backend {
+    if let Some(backend) = args.backend {
+        return backend;
+    }
+    if args.neural_requested || std::env::var_os("RUSTY_NEURAL_GENERATOR").is_some() {
+        Backend::External
+    } else {
+        Backend::Reference
+    }
+}
+
+fn clang_level(args: &ProjectArgs) -> Optimization {
+    args.optimization.unwrap_or(Optimization::O0)
+}
+
+fn build_with_search(
+    project: &Project,
+    optimization: Optimization,
+) -> Result<(project::Artifacts, SearchOutcome, Option<String>), String> {
+    let source = fs::read_to_string(&project.source)
+        .map_err(|error| format!("cannot read {}: {error}", project.source.display()))?;
+    let hir = analyze(&project.source.to_string_lossy(), &source).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let outcome = rewrite::search(&hir, &rewrite::SearchOptions::default());
+    let (program, fallback) = if outcome.pipeline == "identity" {
+        (hir.clone(), None)
+    } else if rewrite::native_equivalent(&hir, &outcome.program)? {
+        (outcome.program.clone(), None)
+    } else {
+        (
+            hir.clone(),
+            Some(format!(
+                "native differential mismatch for pipeline `{}`",
+                outcome.pipeline
+            )),
+        )
+    };
+    let artifacts = project::emit_executable(
+        &program,
+        &project.root.join("build"),
+        &project.name,
+        optimization,
+    )?;
+    Ok((artifacts, outcome, fallback))
+}
+
+fn print_search_outcome(outcome: &SearchOutcome, fallback: Option<&str>) {
+    println!(
+        "backend: rir-search pipeline={} predicted_cost={:.1} identity_cost={:.1} estimated_iterations={}",
+        outcome.pipeline,
+        outcome.predicted_cost,
+        outcome.identity_cost,
+        outcome.estimated_iterations
+    );
+    for candidate in &outcome.candidates {
+        println!(
+            "candidate={} status={} predicted_cost={:.1} iterations={} detail={}",
+            candidate.pipeline,
+            candidate.status,
+            candidate.predicted_cost,
+            candidate.estimated_iterations,
+            candidate.detail
+        );
+    }
+    if let Some(reason) = fallback {
+        println!("selection=REFERENCE_FALLBACK reason={reason}");
+    }
+}
+
+fn command_compare(manifest: &std::path::Path, args: &ProjectArgs) -> Result<u8, String> {
+    let suite = Suite::load(manifest)?;
+    let report = rustybench::run_comparison(&suite, args.warmup, args.repeat, args.split)?;
+    println!(
+        "RustyBench compare cases={} warmup={} repeat={} speedup=o3_median/candidate_median",
+        report.results.len(),
+        report.warmup,
+        report.repeat
+    );
+    for case in &report.results {
+        let search_speedup = case.speedup_vs_o3(&case.search);
+        let o2_speedup = case.speedup_vs_o3(&case.reference_o2);
+        let comparison = case.search_comparison();
+        let (low, high, clears) = comparison
+            .as_ref()
+            .map(|value| {
+                (
+                    format!("{:.4}", value.speedup_ci95_low),
+                    format!("{:.4}", value.speedup_ci95_high),
+                    value.speedup_ci95_low >= 1.10,
+                )
+            })
+            .unwrap_or_else(|| ("n/a".to_owned(), "n/a".to_owned(), false));
+        println!(
+            "{} pipeline={} fallback={} o2_ns={:.0} o3_ns={:.0} search_ns={:.0} speedup_o2={} speedup_search={} ci95=[{}, {}] clears_10pct={}",
+            case.id,
+            case.pipeline,
+            case.fallback.as_deref().unwrap_or("no"),
+            case.reference_o2.statistics.median_ns,
+            case.reference_o3.statistics.median_ns,
+            case.search.statistics.median_ns,
+            o2_speedup
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            search_speedup
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            low,
+            high,
+            clears
+        );
+    }
+    println!(
+        "geometric_mean_speedup_vs_o3 search={} o2={}",
+        report
+            .geometric_mean_speedup(|case| case.speedup_vs_o3(&case.search))
+            .map(|value| format!("{value:.4}"))
+            .unwrap_or_else(|| "n/a".to_owned()),
+        report
+            .geometric_mean_speedup(|case| case.speedup_vs_o3(&case.reference_o2))
+            .map(|value| format!("{value:.4}"))
+            .unwrap_or_else(|| "n/a".to_owned())
+    );
+    if let Some(path) = &args.output {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        fs::write(path, report.to_json())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        println!("record={}", path.display());
+    }
+    Ok(0)
+}
+
 fn fallback_notice(neural_requested: bool) {
     if neural_requested {
         eprintln!(
@@ -458,11 +651,11 @@ fn print_usage() {
     println!("commands:");
     println!("  new <name>                 Create a project");
     println!("  check [project]            Parse, resolve, and type-check");
-    println!("  build [project] [-O0|-O2|-O3|-Oai]");
+    println!("  build [project] [-O0|-O2|-O3|-Oai] [--backend reference|search|external]");
     println!("  run [project] [-- args...] Build and execute");
     println!("  test [project]             Check and run tests/*.ry");
-    println!("  bench [project] [--warmup N] [--repeat N] [-- args...]");
-    println!("  bench --suite FILE [--split NAME] [--output FILE]");
+    println!("  bench [project] [-O0|-O2|-O3] [--warmup N] [--repeat N] [-- args...]");
+    println!("  bench --suite FILE [--split NAME] [--output FILE] [--compare]");
     println!("  optimize [project] [--budget N] [--target-cpu CPU]");
     println!("                     [--performance-gate] [--minimum-speedup 2%]");
     println!("  research list|run|compare|report");

@@ -1,5 +1,6 @@
-use crate::benchmark::{self, Statistics};
-use crate::project::{Optimization, Project};
+use crate::benchmark::{self, Comparison, Statistics};
+use crate::project::{self, Optimization, Project};
+use crate::{analyze, rewrite};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -323,6 +324,287 @@ pub fn run_suite(
         cpu_frequency_khz_end: cpu_frequency_khz(),
         results,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct CompareColumn {
+    pub label: &'static str,
+    pub samples_ns: Vec<u128>,
+    pub statistics: Statistics,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompareCase {
+    pub id: String,
+    pub category: Category,
+    pub split: Split,
+    pub pipeline: String,
+    pub fallback: Option<String>,
+    pub reference_o2: CompareColumn,
+    pub reference_o3: CompareColumn,
+    pub search: CompareColumn,
+}
+
+impl CompareCase {
+    pub fn speedup_vs_o3(&self, column: &CompareColumn) -> Option<f64> {
+        if column.statistics.median_ns == 0.0 {
+            return None;
+        }
+        Some(self.reference_o3.statistics.median_ns / column.statistics.median_ns)
+    }
+
+    pub fn search_comparison(&self) -> Option<Comparison> {
+        Comparison::from_samples(&self.reference_o3.samples_ns, &self.search.samples_ns, 0.10)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompareReport {
+    pub manifest: PathBuf,
+    pub captured_unix_ms: u128,
+    pub warmup: usize,
+    pub repeat: usize,
+    pub cpu_frequency_khz_start: Option<u64>,
+    pub cpu_frequency_khz_end: Option<u64>,
+    pub results: Vec<CompareCase>,
+}
+
+impl CompareReport {
+    pub fn geometric_mean_speedup(
+        &self,
+        select: impl Fn(&CompareCase) -> Option<f64>,
+    ) -> Option<f64> {
+        let values = self.results.iter().filter_map(select).collect::<Vec<_>>();
+        benchmark::geometric_mean(&values)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut json = String::new();
+        write!(
+            json,
+            "{{\n  \"schema\": \"rustybench-compare-v0\",\n  \"captured_unix_ms\": {},\n  \"manifest\": \"{}\",\n  \"host\": {{\"os\": \"{}\", \"arch\": \"{}\", \"cpu_frequency_khz_start\": {}, \"cpu_frequency_khz_end\": {}}},\n  \"warmup\": {},\n  \"repeat\": {},\n  \"outlier_policy\": \"retain-all\",\n  \"speedup_definition\": \"reference_o3_median / candidate_median\",\n  \"results\": [\n",
+            self.captured_unix_ms,
+            json_escape(&self.manifest.to_string_lossy()),
+            json_escape(std::env::consts::OS),
+            json_escape(std::env::consts::ARCH),
+            optional_number(self.cpu_frequency_khz_start),
+            optional_number(self.cpu_frequency_khz_end),
+            self.warmup,
+            self.repeat
+        )
+        .expect("writing to a string cannot fail");
+        for (index, result) in self.results.iter().enumerate() {
+            if index != 0 {
+                json.push_str(",\n");
+            }
+            write_compare_json(&mut json, result);
+        }
+        json.push_str("\n  ]\n}\n");
+        json
+    }
+}
+
+pub fn run_comparison(
+    suite: &Suite,
+    warmup: usize,
+    repeat: usize,
+    split: Option<Split>,
+) -> Result<CompareReport> {
+    if repeat == 0 {
+        return Err("RustyBench repeat count must be greater than zero".to_owned());
+    }
+    suite.validate_frozen_inputs()?;
+    let cpu_frequency_khz_start = cpu_frequency_khz();
+    let selected = suite
+        .cases
+        .iter()
+        .filter(|case| split.is_none_or(|wanted| case.split == wanted))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err("no RustyBench cases match the requested split".to_owned());
+    }
+    let mut results = Vec::with_capacity(selected.len());
+    for case in selected {
+        results.push(compare_case(case, warmup, repeat)?);
+    }
+    Ok(CompareReport {
+        manifest: suite.manifest.clone(),
+        captured_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+            .as_millis(),
+        warmup,
+        repeat,
+        cpu_frequency_khz_start,
+        cpu_frequency_khz_end: cpu_frequency_khz(),
+        results,
+    })
+}
+
+fn compare_case(case: &Case, warmup: usize, repeat: usize) -> Result<CompareCase> {
+    let project = Project::discover(Some(&case.project))?;
+    let source = fs::read_to_string(&project.source)
+        .map_err(|error| format!("cannot read {}: {error}", project.source.display()))?;
+    let hir = analyze(&project.source.to_string_lossy(), &source).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let outcome = rewrite::search(&hir, &rewrite::SearchOptions::default());
+    let native_ok = rewrite::native_equivalent(&hir, &outcome.program)?;
+    let (program, pipeline, fallback) = if native_ok {
+        (outcome.program, outcome.pipeline.to_owned(), None)
+    } else {
+        (
+            hir.clone(),
+            "identity".to_owned(),
+            Some(format!(
+                "native differential mismatch for pipeline `{}`",
+                outcome.pipeline
+            )),
+        )
+    };
+    let build_root = project.root.join("build");
+    let o2 = project::emit_executable(
+        &hir,
+        &build_root.join("o2"),
+        &project.name,
+        Optimization::O2,
+    )?;
+    let o3 = project::emit_executable(
+        &hir,
+        &build_root.join("o3"),
+        &project.name,
+        Optimization::O3,
+    )?;
+    let search = project::emit_executable(
+        &program,
+        &build_root.join("search"),
+        &project.name,
+        Optimization::O3,
+    )?;
+    let reference_o2 = time_checked(&o2.executable, case, warmup, repeat, "o2")?;
+    let reference_o3 = time_checked(&o3.executable, case, warmup, repeat, "o3")?;
+    let search_column = time_checked(&search.executable, case, warmup, repeat, "search")?;
+    Ok(CompareCase {
+        id: case.id.clone(),
+        category: case.category,
+        split: case.split,
+        pipeline,
+        fallback,
+        reference_o2,
+        reference_o3,
+        search: search_column,
+    })
+}
+
+fn time_checked(
+    executable: &std::path::Path,
+    case: &Case,
+    warmup: usize,
+    repeat: usize,
+    label: &str,
+) -> Result<CompareColumn> {
+    let execute = || {
+        let output = Command::new(executable)
+            .args(&case.args)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "RustyBench case `{}` ({label}) failed to start: {error}",
+                    case.id
+                )
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "RustyBench case `{}` ({label}) exited with {}",
+                case.id, output.status
+            ));
+        }
+        let checksum = stdout_checksum(&output.stdout);
+        if checksum != case.expected_stdout_checksum {
+            return Err(format!(
+                "RustyBench oracle mismatch for `{}` ({label}): expected {:016x}, found {checksum:016x}",
+                case.id, case.expected_stdout_checksum
+            ));
+        }
+        Ok(())
+    };
+    execute()?;
+    for _ in 0..warmup {
+        execute()?;
+    }
+    let mut samples_ns = Vec::with_capacity(repeat);
+    for _ in 0..repeat {
+        let start = Instant::now();
+        execute()?;
+        samples_ns.push(start.elapsed().as_nanos());
+    }
+    let statistics = Statistics::from_samples(&samples_ns).expect("repeat count is positive");
+    Ok(CompareColumn {
+        label: match label {
+            "o2" => "clang-o2",
+            "o3" => "clang-o3",
+            _ => "rir-search-o3",
+        },
+        samples_ns,
+        statistics,
+    })
+}
+
+fn write_compare_json(json: &mut String, result: &CompareCase) {
+    let comparison = result.search_comparison();
+    write!(
+        json,
+        "    {{\"id\": \"{}\", \"category\": \"{}\", \"split\": \"{}\", \"pipeline\": \"{}\", \"fallback\": {}, \"o2_median_ns\": {:.3}, \"o3_median_ns\": {:.3}, \"search_median_ns\": {:.3}, \"speedup_o2_vs_o3\": {}, \"speedup_search_vs_o3\": {}, \"search_speedup_ci95\": [{}, {}], \"search_clears_10_percent\": {}, \"samples_o3_ns\": {}, \"samples_search_ns\": {}}}",
+        json_escape(&result.id),
+        result.category.as_str(),
+        result.split.as_str(),
+        json_escape(&result.pipeline),
+        result
+            .fallback
+            .as_deref()
+            .map(|reason| format!("\"{}\"", json_escape(reason)))
+            .unwrap_or_else(|| "null".to_owned()),
+        result.reference_o2.statistics.median_ns,
+        result.reference_o3.statistics.median_ns,
+        result.search.statistics.median_ns,
+        json_optional(result.speedup_vs_o3(&result.reference_o2)),
+        json_optional(result.speedup_vs_o3(&result.search)),
+        comparison
+            .as_ref()
+            .map(|comparison| format!("{:.6}", comparison.speedup_ci95_low))
+            .unwrap_or_else(|| "null".to_owned()),
+        comparison
+            .as_ref()
+            .map(|comparison| format!("{:.6}", comparison.speedup_ci95_high))
+            .unwrap_or_else(|| "null".to_owned()),
+        comparison
+            .as_ref()
+            .map(|comparison| comparison.speedup_ci95_low >= 1.10)
+            .unwrap_or(false),
+        json_samples(&result.reference_o3.samples_ns),
+        json_samples(&result.search.samples_ns)
+    )
+    .unwrap();
+}
+
+fn json_optional(value: Option<f64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |value| format!("{value:.6}"))
+}
+
+fn json_samples(samples: &[u128]) -> String {
+    let mut out = String::from("[");
+    for (index, sample) in samples.iter().enumerate() {
+        if index != 0 {
+            out.push_str(", ");
+        }
+        write!(out, "{sample}").unwrap();
+    }
+    out.push(']');
+    out
 }
 
 fn optional_number(value: Option<u64>) -> String {
