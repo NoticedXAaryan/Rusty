@@ -57,6 +57,7 @@ Create a project with `cargo run -- new hello`. A project contains `Rusty.toml`,
 - [Conformance policy](docs/conformance-v0.md)
 - [Benchmarking and RustyBench](docs/benchmarking.md)
 - [Neural optimization protocol](docs/optimization.md)
+- [Research direction: learned RIR optimization](docs/research/rir-optimization.md)
 
 ## Development
 
