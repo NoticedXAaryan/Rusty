@@ -1,0 +1,7 @@
+fn main() {
+    var acc = 0
+    for i in 0..6000000 {
+        acc += (i * 3 + 1) % 1024
+    }
+    print(acc)
+}

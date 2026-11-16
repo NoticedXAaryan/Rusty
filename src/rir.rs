@@ -179,6 +179,18 @@ fn serialize_expr(out: &mut String, expression: &Expr) {
                 serialize_expr(out, arg);
             }
         }
+        ExprKind::RawDiv { left, right } => {
+            out.push_str("div-raw ");
+            serialize_expr(out, left);
+            out.push(' ');
+            serialize_expr(out, right);
+        }
+        ExprKind::RawRem { left, right } => {
+            out.push_str("rem-raw ");
+            serialize_expr(out, left);
+            out.push(' ');
+            serialize_expr(out, right);
+        }
     }
     out.push(')');
 }

@@ -1,0 +1,7 @@
+fn main() {
+    var acc = 0
+    for i in 0..4000000 {
+        acc += i
+    }
+    print(acc)
+}

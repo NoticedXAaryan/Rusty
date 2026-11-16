@@ -1,0 +1,7 @@
+rustybench-v0
+series	numerical	development	series	a2cfb59a36e190c2	25d2c953427c3f2b
+modsum	numerical	development	modsum	0947473d8cb0ef9a	0b9c686626cee358
+invdiv	numerical	development	invdiv	e60d0bb496182b66	30aea8e6232a07a6
+branch	branch	development	branch	6d9f5fb91bb6b921	d1ff445cd26288c7
+mix	algorithm	development	mix	f99ecfdcb2fa4245	a945a9f4857c731e
+hello	microbenchmark	development	hello	24b2092c90c5e786	0d8f7f8cc8f9ae78

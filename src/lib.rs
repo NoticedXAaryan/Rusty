@@ -3,7 +3,9 @@
 pub mod ast;
 pub mod benchmark;
 pub mod diagnostic;
+pub mod eqsat;
 pub mod hir;
+pub mod interp;
 pub mod lexer;
 pub mod llvm;
 pub mod neural;
@@ -11,6 +13,7 @@ pub mod optimization;
 pub mod parser;
 pub mod project;
 pub mod research;
+pub mod rewrite;
 pub mod rir;
 pub mod rustybench;
 pub mod sema;
