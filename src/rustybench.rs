@@ -1,6 +1,7 @@
 use crate::benchmark::{self, Comparison, Statistics};
-use crate::project::{self, Optimization, Project};
-use crate::{analyze, rewrite};
+use crate::hir::Program as HirProgram;
+use crate::project::{Optimization, Project};
+use crate::{analyze, llvm, rewrite, rir};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -342,7 +343,9 @@ pub struct CompareCase {
     pub fallback: Option<String>,
     pub reference_o2: CompareColumn,
     pub reference_o3: CompareColumn,
+    pub reference_native: CompareColumn,
     pub search: CompareColumn,
+    pub search_native: CompareColumn,
 }
 
 impl CompareCase {
@@ -356,6 +359,14 @@ impl CompareCase {
     pub fn search_comparison(&self) -> Option<Comparison> {
         Comparison::from_samples(&self.reference_o3.samples_ns, &self.search.samples_ns, 0.10)
     }
+
+    pub fn native_comparison(&self) -> Option<Comparison> {
+        Comparison::from_samples(
+            &self.reference_native.samples_ns,
+            &self.search_native.samples_ns,
+            0.10,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -366,7 +377,10 @@ pub struct CompareReport {
     pub repeat: usize,
     pub cpu_frequency_khz_start: Option<u64>,
     pub cpu_frequency_khz_end: Option<u64>,
+    /// Fresh timing. This is the run to quote.
     pub results: Vec<CompareCase>,
+    /// First timing, kept so a lucky layout is visible and not quoted.
+    pub discovery: Vec<CompareCase>,
 }
 
 impl CompareReport {
@@ -382,7 +396,7 @@ impl CompareReport {
         let mut json = String::new();
         write!(
             json,
-            "{{\n  \"schema\": \"rustybench-compare-v0\",\n  \"captured_unix_ms\": {},\n  \"manifest\": \"{}\",\n  \"host\": {{\"os\": \"{}\", \"arch\": \"{}\", \"cpu_frequency_khz_start\": {}, \"cpu_frequency_khz_end\": {}}},\n  \"warmup\": {},\n  \"repeat\": {},\n  \"outlier_policy\": \"retain-all\",\n  \"speedup_definition\": \"reference_o3_median / candidate_median\",\n  \"results\": [\n",
+            "{{\n  \"schema\": \"rustybench-compare-v1\",\n  \"captured_unix_ms\": {},\n  \"manifest\": \"{}\",\n  \"host\": {{\"os\": \"{}\", \"arch\": \"{}\", \"cpu_frequency_khz_start\": {}, \"cpu_frequency_khz_end\": {}}},\n  \"warmup\": {},\n  \"repeat\": {},\n  \"outlier_policy\": \"retain-all\",\n  \"speedup_definition\": \"baseline_median / candidate_median\",\n  \"reported_phase\": \"confirmation\",\n  \"layout\": \"randomized-link-order-and-environment-size\",\n  \"gate_reported_against\": 0.10,\n  \"results\": [\n",
             self.captured_unix_ms,
             json_escape(&self.manifest.to_string_lossy()),
             json_escape(std::env::consts::OS),
@@ -394,6 +408,13 @@ impl CompareReport {
         )
         .expect("writing to a string cannot fail");
         for (index, result) in self.results.iter().enumerate() {
+            if index != 0 {
+                json.push_str(",\n");
+            }
+            write_compare_json(&mut json, result);
+        }
+        json.push_str("\n  ],\n  \"discovery\": [\n");
+        for (index, result) in self.discovery.iter().enumerate() {
             if index != 0 {
                 json.push_str(",\n");
             }
@@ -423,9 +444,15 @@ pub fn run_comparison(
     if selected.is_empty() {
         return Err("no RustyBench cases match the requested split".to_owned());
     }
-    let mut results = Vec::with_capacity(selected.len());
+    let mut prepared = Vec::with_capacity(selected.len());
     for case in selected {
-        results.push(compare_case(case, warmup, repeat)?);
+        prepared.push(prepare_case(case)?);
+    }
+    let mut discovery = Vec::with_capacity(prepared.len());
+    let mut results = Vec::with_capacity(prepared.len());
+    for case in &prepared {
+        discovery.push(time_prepared(case, 0, warmup, repeat)?);
+        results.push(time_prepared(case, 1, warmup, repeat)?);
     }
     Ok(CompareReport {
         manifest: suite.manifest.clone(),
@@ -438,10 +465,22 @@ pub fn run_comparison(
         cpu_frequency_khz_start,
         cpu_frequency_khz_end: cpu_frequency_khz(),
         results,
+        discovery,
     })
 }
 
-fn compare_case(case: &Case, warmup: usize, repeat: usize) -> Result<CompareCase> {
+struct PreparedCase {
+    case: Case,
+    pipeline: String,
+    fallback: Option<String>,
+    o2: Vec<PathBuf>,
+    o3: Vec<PathBuf>,
+    native: Vec<PathBuf>,
+    search: Vec<PathBuf>,
+    search_native: Vec<PathBuf>,
+}
+
+fn prepare_case(case: &Case) -> Result<PreparedCase> {
     let project = Project::discover(Some(&case.project))?;
     let source = fs::read_to_string(&project.source)
         .map_err(|error| format!("cannot read {}: {error}", project.source.display()))?;
@@ -466,50 +505,167 @@ fn compare_case(case: &Case, warmup: usize, repeat: usize) -> Result<CompareCase
             )),
         )
     };
-    let build_root = project.root.join("build");
-    let o2 = project::emit_executable(
-        &hir,
-        &build_root.join("o2"),
-        &project.name,
-        Optimization::O2,
-    )?;
-    let o3 = project::emit_executable(
-        &hir,
-        &build_root.join("o3"),
-        &project.name,
-        Optimization::O3,
-    )?;
-    let search = project::emit_executable(
-        &program,
-        &build_root.join("search"),
-        &project.name,
-        Optimization::O3,
-    )?;
-    let reference_o2 = time_checked(&o2.executable, case, warmup, repeat, "o2")?;
-    let reference_o3 = time_checked(&o3.executable, case, warmup, repeat, "o3")?;
-    let search_column = time_checked(&search.executable, case, warmup, repeat, "search")?;
-    Ok(CompareCase {
-        id: case.id.clone(),
-        category: case.category,
-        split: case.split,
+    let build_root = project.root.join("build").join("compare");
+    Ok(PreparedCase {
+        case: case.clone(),
         pipeline,
         fallback,
-        reference_o2,
-        reference_o3,
-        search: search_column,
+        o2: layout_binaries(&hir, &build_root.join("o2"), &project.name, "-O2", false)?,
+        o3: layout_binaries(&hir, &build_root.join("o3"), &project.name, "-O3", false)?,
+        native: layout_binaries(
+            &hir,
+            &build_root.join("o3-native"),
+            &project.name,
+            "-O3",
+            true,
+        )?,
+        search: layout_binaries(
+            &program,
+            &build_root.join("search"),
+            &project.name,
+            "-O3",
+            false,
+        )?,
+        search_native: layout_binaries(
+            &program,
+            &build_root.join("search-native"),
+            &project.name,
+            "-O3",
+            true,
+        )?,
     })
 }
 
-fn time_checked(
-    executable: &std::path::Path,
+fn layout_binaries(
+    program: &HirProgram,
+    directory: &Path,
+    name: &str,
+    optimization: &str,
+    march_native: bool,
+) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let llvm_path = directory.join(format!("{name}.ll"));
+    fs::write(&llvm_path, llvm::emit(&rir::Program::from_hir(program)))
+        .map_err(|error| format!("cannot write {}: {error}", llvm_path.display()))?;
+    let mut binaries = Vec::with_capacity(4);
+    for variant in 0..4 {
+        let pad = directory.join(format!("pad-{variant}.ll"));
+        let bytes = 32 * (variant + 1);
+        fs::write(
+            &pad,
+            format!(
+                "source_filename = \"pad\"\n@rusty.pad.{variant} = global [{bytes} x i8] zeroinitializer\n@llvm.used = appending global [1 x ptr] [ptr @rusty.pad.{variant}]\n"
+            ),
+        )
+        .map_err(|error| format!("cannot write {}: {error}", pad.display()))?;
+        let executable = directory.join(format!("{name}-layout-{variant}"));
+        link_layout(
+            &llvm_path,
+            &pad,
+            &executable,
+            optimization,
+            march_native,
+            variant % 2 == 0,
+        )?;
+        binaries.push(executable);
+    }
+    Ok(binaries)
+}
+
+fn link_layout(
+    program: &Path,
+    pad: &Path,
+    executable: &Path,
+    optimization: &str,
+    march_native: bool,
+    program_first: bool,
+) -> Result<()> {
+    let clang = std::env::var_os("CLANG").unwrap_or_else(|| "clang".into());
+    let mut command = Command::new(&clang);
+    command.arg(optimization);
+    if march_native {
+        command.arg("-march=native");
+    }
+    if program_first {
+        command.arg(program).arg(pad);
+    } else {
+        command.arg(pad).arg(program);
+    }
+    let output = command
+        .arg("-o")
+        .arg(executable)
+        .output()
+        .map_err(|error| format!("cannot invoke clang: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "clang failed with {}:\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn time_prepared(
+    case: &PreparedCase,
+    phase: u32,
+    warmup: usize,
+    repeat: usize,
+) -> Result<CompareCase> {
+    Ok(CompareCase {
+        id: case.case.id.clone(),
+        category: case.case.category,
+        split: case.case.split,
+        pipeline: case.pipeline.clone(),
+        fallback: case.fallback.clone(),
+        reference_o2: time_layouts(&case.o2, &case.case, warmup, repeat, phase, "clang-o2")?,
+        reference_o3: time_layouts(&case.o3, &case.case, warmup, repeat, phase, "clang-o3")?,
+        reference_native: time_layouts(
+            &case.native,
+            &case.case,
+            warmup,
+            repeat,
+            phase,
+            "clang-o3-native",
+        )?,
+        search: time_layouts(
+            &case.search,
+            &case.case,
+            warmup,
+            repeat,
+            phase,
+            "rir-eqsat-o3",
+        )?,
+        search_native: time_layouts(
+            &case.search_native,
+            &case.case,
+            warmup,
+            repeat,
+            phase,
+            "rir-eqsat-o3-native",
+        )?,
+    })
+}
+
+fn time_layouts(
+    executables: &[PathBuf],
     case: &Case,
     warmup: usize,
     repeat: usize,
-    label: &str,
+    phase: u32,
+    label: &'static str,
 ) -> Result<CompareColumn> {
-    let execute = || {
-        let output = Command::new(executable)
+    let invoke = |sample: usize| {
+        let variant = (sample + phase as usize) % executables.len();
+        let pad = ((sample + 1)
+            .saturating_mul(phase as usize + 3)
+            .saturating_mul(131))
+            % 4096;
+        let output = Command::new(&executables[variant])
             .args(&case.args)
+            .env("RUSTY_LAYOUT_PAD", "p".repeat(pad))
             .output()
             .map_err(|error| {
                 format!(
@@ -532,23 +688,19 @@ fn time_checked(
         }
         Ok(())
     };
-    execute()?;
-    for _ in 0..warmup {
-        execute()?;
+    invoke(0)?;
+    for sample in 0..warmup {
+        invoke(sample)?;
     }
     let mut samples_ns = Vec::with_capacity(repeat);
-    for _ in 0..repeat {
+    for sample in 0..repeat {
         let start = Instant::now();
-        execute()?;
+        invoke(warmup + sample)?;
         samples_ns.push(start.elapsed().as_nanos());
     }
     let statistics = Statistics::from_samples(&samples_ns).expect("repeat count is positive");
     Ok(CompareColumn {
-        label: match label {
-            "o2" => "clang-o2",
-            "o3" => "clang-o3",
-            _ => "rir-search-o3",
-        },
+        label,
         samples_ns,
         statistics,
     })
@@ -556,9 +708,13 @@ fn time_checked(
 
 fn write_compare_json(json: &mut String, result: &CompareCase) {
     let comparison = result.search_comparison();
+    let native = result.native_comparison();
+    let native_speedup = (result.search_native.statistics.median_ns > 0.0).then_some(
+        result.reference_native.statistics.median_ns / result.search_native.statistics.median_ns,
+    );
     write!(
         json,
-        "    {{\"id\": \"{}\", \"category\": \"{}\", \"split\": \"{}\", \"pipeline\": \"{}\", \"fallback\": {}, \"o2_median_ns\": {:.3}, \"o3_median_ns\": {:.3}, \"search_median_ns\": {:.3}, \"speedup_o2_vs_o3\": {}, \"speedup_search_vs_o3\": {}, \"search_speedup_ci95\": [{}, {}], \"search_clears_10_percent\": {}, \"samples_o3_ns\": {}, \"samples_search_ns\": {}}}",
+        "    {{\"id\": \"{}\", \"category\": \"{}\", \"split\": \"{}\", \"pipeline\": \"{}\", \"fallback\": {}, \"o2_median_ns\": {:.3}, \"o3_median_ns\": {:.3}, \"o3_native_median_ns\": {:.3}, \"search_median_ns\": {:.3}, \"search_native_median_ns\": {:.3}, \"speedup_o2_vs_o3\": {}, \"speedup_search_vs_o3\": {}, \"speedup_search_vs_native\": {}, \"search_speedup_ci95\": [{}, {}], \"search_native_speedup_ci95\": [{}, {}], \"search_clears_10_percent\": {}, \"search_native_clears_10_percent\": {}}}",
         json_escape(&result.id),
         result.category.as_str(),
         result.split.as_str(),
@@ -570,9 +726,12 @@ fn write_compare_json(json: &mut String, result: &CompareCase) {
             .unwrap_or_else(|| "null".to_owned()),
         result.reference_o2.statistics.median_ns,
         result.reference_o3.statistics.median_ns,
+        result.reference_native.statistics.median_ns,
         result.search.statistics.median_ns,
+        result.search_native.statistics.median_ns,
         json_optional(result.speedup_vs_o3(&result.reference_o2)),
         json_optional(result.speedup_vs_o3(&result.search)),
+        json_optional(native_speedup),
         comparison
             .as_ref()
             .map(|comparison| format!("{:.6}", comparison.speedup_ci95_low))
@@ -581,30 +740,26 @@ fn write_compare_json(json: &mut String, result: &CompareCase) {
             .as_ref()
             .map(|comparison| format!("{:.6}", comparison.speedup_ci95_high))
             .unwrap_or_else(|| "null".to_owned()),
+        native
+            .as_ref()
+            .map(|comparison| format!("{:.6}", comparison.speedup_ci95_low))
+            .unwrap_or_else(|| "null".to_owned()),
+        native
+            .as_ref()
+            .map(|comparison| format!("{:.6}", comparison.speedup_ci95_high))
+            .unwrap_or_else(|| "null".to_owned()),
         comparison
             .as_ref()
-            .map(|comparison| comparison.speedup_ci95_low >= 1.10)
-            .unwrap_or(false),
-        json_samples(&result.reference_o3.samples_ns),
-        json_samples(&result.search.samples_ns)
+            .is_some_and(|comparison| comparison.speedup_ci95_low >= 1.10),
+        native
+            .as_ref()
+            .is_some_and(|comparison| comparison.speedup_ci95_low >= 1.10)
     )
     .unwrap();
 }
 
 fn json_optional(value: Option<f64>) -> String {
     value.map_or_else(|| "null".to_owned(), |value| format!("{value:.6}"))
-}
-
-fn json_samples(samples: &[u128]) -> String {
-    let mut out = String::from("[");
-    for (index, sample) in samples.iter().enumerate() {
-        if index != 0 {
-            out.push_str(", ");
-        }
-        write!(out, "{sample}").unwrap();
-    }
-    out.push(']');
-    out
 }
 
 fn optional_number(value: Option<u64>) -> String {
@@ -731,6 +886,12 @@ fn write_case_json(json: &mut String, result: &CaseResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_development_suite_is_frozen() {
+        let bytes = include_bytes!("../examples/kernels/suite.tsv");
+        assert_eq!(checksum(bytes), 0x990e_917b_9a65_fba2);
+    }
 
     #[test]
     fn checksum_is_stable() {

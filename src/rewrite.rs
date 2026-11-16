@@ -69,7 +69,7 @@ struct Pipeline {
     rank: u8,
 }
 
-const PIPELINES: [Pipeline; 4] = [
+const PIPELINES: [Pipeline; 5] = [
     Pipeline {
         name: "identity",
         rank: 0,
@@ -79,12 +79,16 @@ const PIPELINES: [Pipeline; 4] = [
         rank: 1,
     },
     Pipeline {
-        name: "affine",
+        name: "eqsat",
         rank: 2,
     },
     Pipeline {
-        name: "eval",
+        name: "affine",
         rank: 3,
+    },
+    Pipeline {
+        name: "eval",
+        rank: 4,
     },
 ];
 
@@ -238,6 +242,7 @@ fn apply(program: &Program, pipeline: &str, budget: u64) -> Option<Program> {
             let folded = fold_inline(program);
             Some(fold_program(&affine_sums(&folded)))
         }
+        "eqsat" => Some(crate::eqsat::optimize(&fold_inline(program))),
         "eval" => {
             let folded = fold_inline(program);
             let estimate = estimate_iterations(&folded)?;
@@ -986,6 +991,19 @@ fn reduce_block(block: &[Stmt], known: &mut BTreeMap<usize, i64>) -> Vec<Stmt> {
     output
 }
 
+pub(crate) fn proven_accumulator(
+    body: &Expr,
+    index: usize,
+    start: i64,
+    end: i64,
+    init: i64,
+) -> Option<i64> {
+    let kind = sum_kind(body, index)?;
+    let sum = sum_of(&kind, start, end)?;
+    let final_value = i64::try_from(i128::from(init).checked_add(sum)?).ok()?;
+    prefix_matches(&kind, start, end, init, final_value).then_some(final_value)
+}
+
 fn reduce_for(
     index: usize,
     start: &Expr,
@@ -1342,6 +1360,9 @@ fn is_pure(expression: &Expr) -> bool {
         ExprKind::Unary { expr, .. } => is_pure(expr),
         ExprKind::Binary { left, right, .. } => is_pure(left) && is_pure(right),
         ExprKind::Call { .. } | ExprKind::Print(_) => false,
+        ExprKind::RawDiv { left, right } | ExprKind::RawRem { left, right } => {
+            is_pure(left) && is_pure(right)
+        }
     }
 }
 
@@ -1475,7 +1496,7 @@ mod tests {
         let source = "fn main() { var acc = 0\nfor i in 0..20000 { acc += (i * 3 + 1) % 1024 }\nprint(acc) }";
         let original = program(source);
         let outcome = search(&original, &SearchOptions::default());
-        assert_eq!(outcome.pipeline, "affine");
+        assert_eq!(outcome.pipeline, "eqsat");
         assert_eq!(stdout_of(&original), stdout_of(&outcome.program));
         assert!(outcome.estimated_iterations < 8);
         assert!(

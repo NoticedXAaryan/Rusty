@@ -71,6 +71,10 @@ Pretrain an encoder on RIR and LLVM IR by predicting embeddings of masked subgra
 - Treating a geomean on closed scalar kernels as a SPEC-style claim. Those kernels are the development set named in the measurement note.
 - Publishing a discovery run that has not been remeasured under layout randomization.
 
+## Implementation status
+
+Direction 1 is in the compiler (`src/eqsat.rs`, the `egg` 0.11 crate). It saturates algebraic rewrites, drops the division guard for a constant divisor other than 0 and -1, and extracts a closed form for the accumulator loops whose `i128` proof succeeds. The cost function picks the extracted term. The interpreter, a native diff, and a differential fuzzer still have to agree. Direction 2 and direction 3 are not implemented. The external generator's 2% gate is unchanged. `rusty bench --suite … --compare` reports against 10% and quotes the second, layout-randomized timing.
+
 ## References
 
 - Mahmoud Assran et al. "Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture." CVPR 2023. arXiv:2301.08243.

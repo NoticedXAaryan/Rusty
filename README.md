@@ -30,8 +30,9 @@ fn main() {
 source → lexer → parser → name resolution → type checker
        → typed HIR → canonical RIR → LLVM IR → native executable
                          │
-                         └─ optional search: fold, inline, affine summaries,
-                            bounded partial evaluation
+                         └─ optional search: egg equality saturation
+                            (algebra, unguarded div, loop closed forms)
+                            plus bounded partial evaluation
                             accept only if the interpreter and a native diff agree
 ```
 
@@ -39,16 +40,16 @@ The reference compiler has source-located diagnostics, deterministic name and ty
 
 ## What the search measured
 
-On the six public development kernels in `examples/kernels/` (not the private held-out suite), one release run with 5 warm-ups and 30 retained samples produced a geometric-mean speedup of **3.81×** versus reference `-O3` on this host (Intel Xeon, family 6 model 207, Clang 18.1.3). Four kernels clear a 10% lower confidence bound. Two do not: Clang already deletes the plain induction sum, and `hello` has no loop to remove. `-O2` is not faster than `-O3` here (geometric mean 0.99×).
+On the six frozen public development kernels in `examples/kernels/` (not a private held-out suite), the **confirmation** run is what counts: 5 warm-ups, 30 retained samples, link order and environment size randomized, after a separate discovery timing that is not quoted. Host: Intel Xeon, family 6 model 207, Clang 18.1.3. Geometric mean versus reference `-O3` is **3.708×**. Versus `-O3 -march=native` it is **2.349×**. Four kernels clear a 10% lower bound against both baselines. `series` and `hello` do not. `-O2` versus `-O3` is noise here (geometric mean 1.004×). Alive2 was not on `PATH`, so these rewrites are not formally translation-validated.
 
-| Kernel | Pipeline | -O3 median | Search median | Speedup | 95% CI | Clears 10% |
-|---|---|---:|---:|---:|---|---|
-| series | affine | 281570 ns | 258780 ns | 1.0881× | [1.0190, 1.2054] | no |
-| modsum | affine | 2020153 ns | 274290 ns | 7.3650× | [7.1045, 7.6258] | yes |
-| invdiv | affine | 4619414 ns | 282158 ns | 16.3718× | [15.1100, 17.1613] | yes |
-| branch | eval | 1055590 ns | 271762 ns | 3.8842× | [3.4126, 4.2973] | yes |
-| mix | eval | 1661012 ns | 277816 ns | 5.9788× | [4.9899, 6.2949] | yes |
-| hello | identity | 265826 ns | 263019 ns | 1.0107× | [0.9423, 1.0826] | no |
+| Kernel | Pipeline | -O3 median (ns) | Search (ns) | vs -O3 | 95% CI | Clears 10% | vs `-march=native` | Clears 10% |
+|---|---|---:|---:|---:|---|---|---:|---|
+| series | eqsat | 289542.5 | 292687.5 | 0.9893× | [0.9315, 1.0816] | no | 0.9663× | no |
+| modsum | eqsat | 2099153.0 | 313608.5 | 6.6935× | [5.9583, 7.0177] | yes | 3.1426× | yes |
+| invdiv | eqsat | 4698783.5 | 294608.0 | 15.9493× | [13.6855, 16.4068] | yes | 7.7675× | yes |
+| branch | eval | 1166831.5 | 307025.0 | 3.8004× | [3.4367, 4.0300] | yes | 2.4075× | yes |
+| mix | eval | 1642481.5 | 280373.5 | 5.8582× | [5.5243, 6.0140] | yes | 3.5494× | yes |
+| hello | identity | 306362.5 | 277353.5 | 1.1046× | [0.9914, 1.4830] | no | 0.8337× | no |
 
 Full host notes, the `-O2` column, and the reading of the table are in [docs/research/measurements.md](docs/research/measurements.md). Reproduce with:
 

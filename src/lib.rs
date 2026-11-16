@@ -3,6 +3,7 @@
 pub mod ast;
 pub mod benchmark;
 pub mod diagnostic;
+pub mod eqsat;
 pub mod hir;
 pub mod interp;
 pub mod lexer;

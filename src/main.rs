@@ -565,15 +565,19 @@ fn command_compare(manifest: &std::path::Path, args: &ProjectArgs) -> Result<u8,
     let suite = Suite::load(manifest)?;
     let report = rustybench::run_comparison(&suite, args.warmup, args.repeat, args.split)?;
     println!(
-        "RustyBench compare cases={} warmup={} repeat={} speedup=o3_median/candidate_median",
+        "RustyBench compare reported=confirmation cases={} warmup={} repeat={} layout=randomized",
         report.results.len(),
         report.warmup,
         report.repeat
     );
     for case in &report.results {
         let search_speedup = case.speedup_vs_o3(&case.search);
+        let native_speedup = (case.search_native.statistics.median_ns > 0.0).then_some(
+            case.reference_native.statistics.median_ns / case.search_native.statistics.median_ns,
+        );
         let o2_speedup = case.speedup_vs_o3(&case.reference_o2);
         let comparison = case.search_comparison();
+        let native_comparison = case.native_comparison();
         let (low, high, clears) = comparison
             .as_ref()
             .map(|value| {
@@ -585,22 +589,28 @@ fn command_compare(manifest: &std::path::Path, args: &ProjectArgs) -> Result<u8,
             })
             .unwrap_or_else(|| ("n/a".to_owned(), "n/a".to_owned(), false));
         println!(
-            "{} pipeline={} fallback={} o2_ns={:.0} o3_ns={:.0} search_ns={:.0} speedup_o2={} speedup_search={} ci95=[{}, {}] clears_10pct={}",
+            "{} pipeline={} fallback={} o2_ns={:.0} o3_ns={:.0} native_ns={:.0} search_ns={:.0} search_native_ns={:.0} speedup_o2={} speedup_search={} speedup_native={} ci95=[{}, {}] clears_10pct={} native_clears_10pct={}",
             case.id,
             case.pipeline,
             case.fallback.as_deref().unwrap_or("no"),
             case.reference_o2.statistics.median_ns,
             case.reference_o3.statistics.median_ns,
+            case.reference_native.statistics.median_ns,
             case.search.statistics.median_ns,
+            case.search_native.statistics.median_ns,
             o2_speedup
                 .map(|value| format!("{value:.4}"))
                 .unwrap_or_else(|| "n/a".to_owned()),
             search_speedup
                 .map(|value| format!("{value:.4}"))
                 .unwrap_or_else(|| "n/a".to_owned()),
+            native_speedup
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "n/a".to_owned()),
             low,
             high,
-            clears
+            clears,
+            native_comparison.is_some_and(|value| value.speedup_ci95_low >= 1.10)
         );
     }
     println!(

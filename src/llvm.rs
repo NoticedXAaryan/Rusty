@@ -122,6 +122,10 @@ fn collect_expr(expression: &Expr, strings: &mut Vec<String>) {
                 collect_expr(arg, strings);
             }
         }
+        ExprKind::RawDiv { left, right } | ExprKind::RawRem { left, right } => {
+            collect_expr(left, strings);
+            collect_expr(right, strings);
+        }
         _ => {}
     }
 }
@@ -385,6 +389,22 @@ impl<'a> FunctionEmitter<'a> {
                 right,
             } => self.short_circuit(true, left, right),
             ExprKind::Binary { op, left, right } => self.binary(*op, left, right, expression.ty),
+            ExprKind::RawDiv { left, right } | ExprKind::RawRem { left, right } => {
+                let dividend = self.expression(left);
+                let divisor = self.expression(right);
+                let result = self.temp();
+                let opcode = if matches!(expression.kind, ExprKind::RawDiv { .. }) {
+                    "sdiv"
+                } else {
+                    "srem"
+                };
+                let _ = writeln!(
+                    self.out,
+                    "  {result} = {opcode} i64 {}, {}",
+                    dividend.repr, divisor.repr
+                );
+                Value::new(result, expression.ty)
+            }
             ExprKind::Call { function, args, .. } => {
                 let function_info = &self.program.functions[*function];
                 let args = args

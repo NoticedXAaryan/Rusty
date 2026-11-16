@@ -237,6 +237,8 @@ impl<'a> Machine<'a> {
                 }
             }
             ExprKind::Binary { op, left, right } => self.binary(*op, left, right, slots),
+            ExprKind::RawDiv { left, right } => self.raw_div(left, right, slots, false),
+            ExprKind::RawRem { left, right } => self.raw_div(left, right, slots, true),
             ExprKind::Call { function, args, .. } => {
                 let mut values = Vec::with_capacity(args.len());
                 for argument in args {
@@ -328,6 +330,22 @@ fn cmp(left: Value, right: Value, op: impl Fn(i64, i64) -> bool) -> Result<Value
     match (left, right) {
         (Value::Int(left), Value::Int(right)) => Ok(Value::Bool(op(left, right))),
         _ => Err(Stop::Trap),
+    }
+}
+
+impl<'a> Machine<'a> {
+    fn raw_div(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        slots: &[Option<Value>],
+        remainder: bool,
+    ) -> Result<Value, Stop> {
+        // The extractor proved the divisor safe. The interpreter still refuses
+        // the trap cases so a bad proof cannot become a silent wrong value.
+        let left = self.expression(left, slots)?;
+        let right = self.expression(right, slots)?;
+        div(left, right, remainder)
     }
 }
 

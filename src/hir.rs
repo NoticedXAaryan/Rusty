@@ -91,6 +91,17 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     Print(Vec<Expr>),
+    /// Division lowered to raw `sdiv` after a proof that the divisor cannot be
+    /// zero and cannot be the `INT64_MIN / -1` overflow case.
+    RawDiv {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Remainder lowered to raw `srem` under the same proof as [`ExprKind::RawDiv`].
+    RawRem {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
