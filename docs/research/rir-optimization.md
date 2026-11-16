@@ -78,7 +78,7 @@ Pretrain an encoder on RIR and LLVM IR by predicting embeddings of masked subgra
 - Chris Cummins et al. "CompilerGym: Robust, Performant Compiler Optimization Environments for AI Research." CGO 2022. arXiv:2109.08267.
 - Chris Cummins et al. "ProGraML: A Graph-based Program Representation for Data Flow Analysis and Compiler Optimizations." ICML 2021. arXiv:2003.10536.
 - Chaoyi Deng et al. "CompilerDream: Learning a Compiler World Model for General Code Optimization." KDD 2025. arXiv:2404.16077.
-- Ameer Haj-Ali, Qijing Huang, John Xiang, William Moses, Krste Asanović, John Wawrzynek, and Ion Stoica. "AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning." MLSys 2020.
+- Ameer Haj-Ali, Qijing Huang, William Moses, John Xiang, Krste Asanović, John Wawrzynek, and Ion Stoica. "AutoPhase: Juggling HLS Phase Orderings in Random Forests with Deep Reinforcement Learning." MLSys 2020.
 - Hai Huang, Yann LeCun, and Randall Balestriero. "LLM-JEPA: Large Language Models Meet Joint Embedding Predictive Architectures." arXiv:2509.14252.
 - Yann LeCun. "A Path Towards Autonomous Machine Intelligence." 2022. <https://openreview.net/forum?id=BZ5a1r-kVsf>
 - Zhengyang Liu, Stefan Mada, and John Regehr. "Minotaur: A SIMD-Oriented Synthesizing Superoptimizer." PACMPL OOPSLA 2024. arXiv:2306.00229. <https://doi.org/10.1145/3689766>
